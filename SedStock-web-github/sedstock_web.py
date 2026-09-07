@@ -548,12 +548,13 @@ def _cleanup_old_jobs():
                 p.unlink()
         except OSError:
             pass
-    for d in _JOBS_DIR.glob("job_*"):           # папки с оригиналами для предпросмотра
-        try:
-            if d.is_dir() and now - d.stat().st_mtime > _JOB_TTL:
-                shutil.rmtree(d, ignore_errors=True)
-        except OSError:
-            pass
+    for pattern in ("job_*", "out_*"):           # оригиналы предпросмотра + готовые файлы
+        for d in _JOBS_DIR.glob(pattern):
+            try:
+                if d.is_dir() and now - d.stat().st_mtime > _JOB_TTL:
+                    shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                pass
 
 
 # ===========================================================================
@@ -739,17 +740,24 @@ def api_analyze():
             limit_note = f"По лимиту кода взято в работу только {allowed} фото."
 
     custom = request.form.get("instructions", "")[:MAX_CUSTOM_INSTRUCTIONS]
+    # client_id — метка файла, которую прислал браузер (для сопоставления с
+    # оригинальным File на клиенте, например для миниатюры в предпросмотре).
+    # Приходит тем же порядком, что и файлы; если браузер её не прислал —
+    # просто не будет миниатюры, на функциональность это не влияет.
+    client_ids = request.form.getlist("client_ids")
+
     _cleanup_old_jobs()
     job_id = uuid.uuid4().hex
     jdir = _job_dir(job_id)
     jdir.mkdir(parents=True, exist_ok=True)
     manifest = {"items": {}, "created": time.time()}
     items, errors = [], []
-    for f in files:
+    for i, f in enumerate(files):
+        cid = client_ids[i] if i < len(client_ids) else None
         name = os.path.basename(f.filename)
         ext = Path(name).suffix.lower()
         if ext not in ALLOWED_EXT:
-            errors.append({"filename": name, "error": "Неподдерживаемый формат"})
+            errors.append({"filename": name, "error": "Неподдерживаемый формат", "client_id": cid})
             continue
         item_id = uuid.uuid4().hex
         idir = jdir / item_id
@@ -760,11 +768,11 @@ def api_analyze():
             meta = analyze_one(src, custom)
         except Exception as e:
             shutil.rmtree(idir, ignore_errors=True)
-            errors.append({"filename": name, "error": str(e)})
+            errors.append({"filename": name, "error": str(e), "client_id": cid})
             continue
         manifest["items"][item_id] = {"filename": name}
         items.append({
-            "id": item_id, "filename": name,
+            "id": item_id, "filename": name, "client_id": cid,
             "title": meta["title"], "description": meta["description"],
             "keywords": meta["keywords"], "keywords_count": len(meta["keywords"]),
             "is_editorial": meta["is_editorial"], "age": meta.get("age", ""),
@@ -829,15 +837,26 @@ def api_commit():
         return jsonify({"error": "nothing", "message": "Нечего записывать.",
                         "errors": errors}), 400
 
+    # Готовые файлы кладём в отдельную папку out_<job_out> — это позволяет
+    # отдавать их ПО ОДНОМУ (браузер сохраняет прямо в выбранную папку, без
+    # ZIP), а не только архивом. ZIP всё равно собираем — резервный вариант
+    # для браузеров без File System Access API (Safari/Firefox).
     job_out = uuid.uuid4().hex
+    out_dir = _JOBS_DIR / f"out_{job_out}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filenames = []
+    for out_path, arc in results:
+        shutil.copy2(str(out_path), str(out_dir / arc))
+        filenames.append(arc)
+
     zip_path = _JOBS_DIR / f"{job_out}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as z:
-        for out_path, arc in results:
-            z.write(str(out_path), arcname=arc)
+        for arc in filenames:
+            z.write(str(out_dir / arc), arcname=arc)
 
     shutil.rmtree(jdir, ignore_errors=True)          # оригиналы больше не нужны
     return jsonify({"ok": True, "processed": len(results), "failed": len(errors),
-                    "errors": errors, "download_id": job_out})
+                    "errors": errors, "download_id": job_out, "files": filenames})
 
 
 @app.route("/api/download/<job_id>", methods=["GET"])
@@ -850,6 +869,21 @@ def api_download(job_id):
     return send_file(str(zip_path), as_attachment=True,
                      download_name="SedStock-готовые-фото.zip",
                      mimetype="application/zip")
+
+
+@app.route("/api/file/<job_id>/<path:filename>", methods=["GET"])
+def api_file(job_id, filename):
+    """Отдаёт ОДИН готовый файл (без ZIP) — для сохранения напрямую в папку
+    через File System Access API на клиенте."""
+    if not re.fullmatch(r"[0-9a-f]{32}", job_id or ""):
+        return "bad id", 400
+    out_dir = _JOBS_DIR / f"out_{job_id}"
+    # защита от выхода за пределы папки (path traversal) — сравниваем только базовое имя
+    safe_name = os.path.basename(filename)
+    path = out_dir / safe_name
+    if not path.exists() or not path.is_file():
+        return "not found (возможно, срок хранения истёк)", 404
+    return send_file(str(path), as_attachment=True, download_name=safe_name)
 
 
 @app.route("/health")
@@ -910,8 +944,11 @@ INDEX_HTML = r"""<!doctype html>
   .reshead{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
   .reshead b{font-size:15px}
   .pcard{border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:12px;background:#fbfbfd}
-  .pcard .ph{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
-  .pcard .fn{font-weight:600;font-size:14px;word-break:break-all}
+  .pcard .ph{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+  .pcard .thumb{width:52px;height:52px;border-radius:9px;object-fit:cover;flex:none;background:#eee;border:1px solid var(--border)}
+  .pcard .fn{font-weight:600;font-size:14px;word-break:break-all;flex:1}
+  .pickrow{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+  .pickrow button{background:#eef2f7;color:var(--text);border-radius:10px;padding:9px 16px;font-size:13px;font-weight:600}
   .pcard label{display:block;font-size:12px;color:var(--muted);margin:8px 0 3px}
   .pcard input,.pcard textarea{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:9px;
     font-size:14px;font-family:inherit;background:#fff}
@@ -979,9 +1016,14 @@ INDEX_HTML = r"""<!doctype html>
     </details>
     <div class="card">
       <div id="drop" class="drop">
-        Перетащите фото сюда или <b>нажмите, чтобы выбрать</b><br>
+        Перетащите фото <b>или целую папку</b> сюда, или выберите ниже<br>
         <small style="color:var(--muted)">JPG, PNG, WEBP, TIFF · до 30 за раз</small>
         <input id="file" type="file" accept="image/*" multiple hidden>
+        <input id="folderInput" type="file" webkitdirectory directory multiple hidden>
+      </div>
+      <div class="pickrow">
+        <button id="pickFiles" type="button">🖼️ Выбрать фото</button>
+        <button id="pickFolder" type="button">📁 Выбрать папку</button>
       </div>
       <div class="files" id="files"></div>
       <div class="row"><button id="go" disabled>Анализировать</button></div>
@@ -991,7 +1033,10 @@ INDEX_HTML = r"""<!doctype html>
     <div class="card" id="resCard" hidden>
       <div class="reshead">
         <b>Проверьте метаданные и при желании отредактируйте</b>
-        <button id="commit" class="green">⬇ Записать и скачать ZIP</button>
+        <div class="pickrow" style="margin-top:0">
+          <button id="saveFolder" class="green" hidden>💾 Сохранить в папку</button>
+          <button id="commit" class="ghost">⬇ Скачать ZIP-архивом</button>
+        </div>
       </div>
       <div id="preview"></div>
       <div id="errs" class="err"></div>
@@ -1088,14 +1133,56 @@ function renderChip(st){
 }
 function logout(){ clearToken(); location.reload(); }
 
-const drop=$("#drop"), file=$("#file"), go=$("#go"), commit=$("#commit");
-let jobId=null;
-drop.onclick=()=>file.click();
+const drop=$("#drop"), file=$("#file"), folderInput=$("#folderInput"), go=$("#go");
+const zipBtn=$("#commit"), saveFolderBtn=$("#saveFolder");
+let jobId=null, cidToFile={}, committed=null;   // committed = {download_id, files} после /api/commit
+const ALLOWED_EXT_JS=[".jpg",".jpeg",".png",".webp",".tif",".tiff"];
+
+function newCid(){ try{ return crypto.randomUUID(); }catch(e){ return "c"+Date.now()+Math.random().toString(36).slice(2); } }
+
+$("#pickFiles").onclick=()=>file.click();
+$("#pickFolder").onclick=()=>folderInput.click();
+drop.onclick=(ev)=>{ if(ev.target===drop) file.click(); };  // клик по пустой зоне = выбор файлов
 ["dragover","dragenter"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add("over");}));
 ["dragleave","drop"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove("over");}));
-drop.addEventListener("drop",ev=>addFiles(ev.dataTransfer.files));
 file.onchange=()=>addFiles(file.files);
-function addFiles(list){ chosen=Array.from(list).slice(0,30); $("#files").textContent=chosen.length?`Выбрано файлов: ${chosen.length}`:""; go.disabled=chosen.length===0; }
+folderInput.onchange=()=>addFiles(folderInput.files);
+
+// перетаскивание папки: обходим дерево через webkitGetAsEntry (поддерживается
+// и в Safari на macOS, не только в Chrome/Edge) — обычный drop.files папку не разворачивает.
+drop.addEventListener("drop", async (ev)=>{
+  const items=ev.dataTransfer && ev.dataTransfer.items;
+  let hasEntries=false;
+  if(items && items.length && items[0].webkitGetAsEntry){
+    const entries=Array.from(items).map(it=>it.webkitGetAsEntry()).filter(Boolean);
+    if(entries.length){ hasEntries=true;
+      const files=[]; await Promise.all(entries.map(en=>walkEntry(en,files)));
+      addFiles(files);
+    }
+  }
+  if(!hasEntries) addFiles(ev.dataTransfer.files);   // обычный фолбэк (браузеры без entry API)
+});
+function walkEntry(entry, out){
+  return new Promise(resolve=>{
+    if(entry.isFile){ entry.file(f=>{ out.push(f); resolve(); }, resolve); }
+    else if(entry.isDirectory){
+      const reader=entry.createReader();
+      const readBatch=()=>reader.readEntries(async ents=>{
+        if(!ents.length) return resolve();
+        await Promise.all(ents.map(en=>walkEntry(en,out)));
+        readBatch();                                  // readEntries может отдавать частями
+      }, resolve);
+      readBatch();
+    } else resolve();
+  });
+}
+
+function addFiles(list){
+  const arr=Array.from(list).filter(f=>ALLOWED_EXT_JS.some(ext=>f.name.toLowerCase().endsWith(ext)));
+  chosen=arr.slice(0,30).map(f=>({file:f, cid:newCid()}));
+  $("#files").textContent=chosen.length?`Выбрано файлов: ${chosen.length}`:(arr.length?"":"В выбранном нет поддерживаемых фото (JPG/PNG/WEBP/TIFF).");
+  go.disabled=chosen.length===0;
+}
 
 function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
@@ -1104,9 +1191,10 @@ go.onclick=async()=>{
   if(!chosen.length) return;
   go.disabled=true; $("#barWrap").hidden=false; $("#bar").style.width="15%";
   $("#status").textContent="Анализирую… ИИ читает фото (файлы пока не меняются).";
-  $("#resCard").hidden=true; jobId=null;
-  const fd=new FormData(); chosen.forEach(f=>fd.append("images",f)); fd.append("token",getToken());
-  fd.append("instructions",getInstr());
+  $("#resCard").hidden=true; jobId=null; committed=null; saveFolderBtn.hidden=!window.showDirectoryPicker;
+  const fd=new FormData();
+  chosen.forEach(c=>{ fd.append("images",c.file); fd.append("client_ids",c.cid); cidToFile[c.cid]=c.file; });
+  fd.append("token",getToken()); fd.append("instructions",getInstr());
   try{
     const r=await fetch("/api/analyze",{method:"POST",body:fd});
     $("#bar").style.width="90%";
@@ -1124,14 +1212,21 @@ go.onclick=async()=>{
   go.disabled=false;
 };
 
+function thumbSrc(clientId){
+  const f=clientId && cidToFile[clientId];
+  return f ? URL.createObjectURL(f) : "";
+}
+
 function renderPreview(data){
   const box=$("#preview"); box.innerHTML="";
   (data.items||[]).forEach(x=>{
     const kw=(x.keywords||[]).join(", ");
     const on=x.is_editorial?"on":"";
+    const src=thumbSrc(x.client_id);
+    const thumb=src?`<img class="thumb" src="${src}" alt="">`:`<div class="thumb"></div>`;
     box.insertAdjacentHTML("beforeend",
       `<div class="pcard" data-id="${esc(x.id)}" data-ed="${x.is_editorial?1:0}">
-         <div class="ph"><span class="fn">${esc(x.filename)}</span>
+         <div class="ph">${thumb}<span class="fn">${esc(x.filename)}</span>
            <button class="edbadge ${on}" data-role="ed" type="button">Editorial</button></div>
          <label>Заголовок</label><input class="p-title" value="${esc(x.title)}">
          <label>Описание</label><input class="p-desc" value="${esc(x.description)}">
@@ -1140,8 +1235,10 @@ function renderPreview(data){
        </div>`);
   });
   (data.errors||[]).forEach(e=>{
+    const src=thumbSrc(e.client_id);
+    const thumb=src?`<img class="thumb" src="${src}" alt="">`:`<div class="thumb"></div>`;
     box.insertAdjacentHTML("beforeend",
-      `<div class="pcard err"><span class="fn">${esc(e.filename)}</span> — ${esc(e.error)}</div>`);
+      `<div class="pcard err"><div class="ph">${thumb}<span class="fn">${esc(e.filename)}</span></div>${esc(e.error)}</div>`);
   });
   $("#errs").innerHTML="";
 }
@@ -1158,9 +1255,11 @@ $("#preview").addEventListener("input",ev=>{
   const el=ev.target.closest(".pcard").querySelector(".kwc"); if(el) el.textContent=`(${n})`;
 });
 
-// ФАЗА 2 — запись отредактированных метаданных + скачивание ZIP
-commit.onclick=async()=>{
-  if(!jobId) return;
+// ФАЗА 2 — запись отредактированных метаданных (один раз; оба способа
+// скачивания переиспользуют результат, т.к. сервер удаляет оригиналы после записи)
+async function doCommit(){
+  if(committed) return committed;             // уже записано в этом сеансе предпросмотра
+  if(!jobId) throw new Error("Нет активного задания.");
   const items=[];
   document.querySelectorAll("#preview .pcard:not(.err)").forEach(c=>{
     items.push({ id:c.dataset.id,
@@ -1169,15 +1268,60 @@ commit.onclick=async()=>{
       keywords:c.querySelector(".p-kw").value,
       is_editorial:c.dataset.ed==="1" });
   });
-  if(!items.length) return;
-  commit.disabled=true; $("#status").innerHTML="Записываю метаданные в файлы…";
+  if(!items.length) throw new Error("Нечего записывать.");
   const r=await api("/api/commit",{job_id:jobId, token:getToken(), items});
-  commit.disabled=false;
-  if(!r.ok || !r.data.ok){ $("#status").innerHTML=`<span class="err">${esc((r.data&&r.data.message)||"Не удалось записать.")}</span>`; return; }
-  $("#status").innerHTML=`<span class="ok">Записано ${r.data.processed}. Скачивание началось…</span>`;
+  if(!r.ok || !r.data.ok) throw new Error((r.data&&r.data.message)||"Не удалось записать.");
   $("#errs").innerHTML=((r.data.errors)||[]).map(e=>`${esc(e.filename)}: ${esc(e.error)}`).join("<br>");
-  window.location.href="/api/download/"+r.data.download_id;   // ZIP отдаётся как файл
-  jobId=null; $("#resCard").hidden=true; chosen=[]; $("#files").textContent=""; go.disabled=true;
+  committed=r.data;
+  return committed;
+}
+function resetAfterDownload(){
+  jobId=null; chosen=[]; cidToFile={}; $("#files").textContent=""; go.disabled=true;
+}
+
+// «Скачать ZIP-архивом» — работает в ЛЮБОМ браузере (Safari/Firefox тоже)
+zipBtn.onclick=async()=>{
+  zipBtn.disabled=true; $("#status").innerHTML="Записываю метаданные в файлы…";
+  try{
+    const d=await doCommit();
+    $("#status").innerHTML=`<span class="ok">Записано ${d.processed}. Скачивание началось…</span>`;
+    window.location.href="/api/download/"+d.download_id;
+    resetAfterDownload();
+  }catch(e){ $("#status").innerHTML=`<span class="err">${esc(e.message||e)}</span>`; }
+  zipBtn.disabled=false;
+};
+
+// «Сохранить в папку» — БЕЗ архива, файлы летят прямо в выбранную папку.
+// Работает только там, где есть File System Access API (Chrome/Edge на
+// Windows/Mac/Linux). В Safari (macOS/iOS) и Firefox этой кнопки НЕТ —
+// showDirectoryPicker отсутствует, кнопка скрыта (см. go.onclick), и
+// пользователь спокойно пользуется «Скачать ZIP-архивом» выше.
+saveFolderBtn.onclick=async()=>{
+  saveFolderBtn.disabled=true; $("#status").innerHTML="Записываю метаданные в файлы…";
+  try{
+    const d=await doCommit();
+    $("#status").innerHTML="Выберите папку для сохранения…";
+    const dirHandle=await window.showDirectoryPicker();
+    let saved=0; const failed=[];
+    for(const name of d.files){
+      try{
+        const resp=await fetch(`/api/file/${d.download_id}/${encodeURIComponent(name)}`);
+        if(!resp.ok) throw new Error("HTTP "+resp.status);
+        const blob=await resp.blob();
+        const fh=await dirHandle.getFileHandle(name,{create:true});
+        const w=await fh.createWritable(); await w.write(blob); await w.close();
+        saved++;
+      }catch(e){ failed.push(name); }
+    }
+    $("#status").innerHTML = failed.length
+      ? `<span class="err">Сохранено ${saved} из ${d.files.length}. Не удалось: ${failed.map(esc).join(", ")}</span>`
+      : `<span class="ok">Сохранено в папку: ${saved} файл(ов). Готово!</span>`;
+    resetAfterDownload();
+  }catch(e){
+    if(e && e.name==="AbortError"){ $("#status").innerHTML="Отменено."; }   // юзер закрыл диалог выбора папки
+    else { $("#status").innerHTML=`<span class="err">${esc(e.message||e)}</span>`; }
+  }
+  saveFolderBtn.disabled=false;
 };
 </script>
 </div></body></html>"""
