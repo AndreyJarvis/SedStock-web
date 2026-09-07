@@ -96,6 +96,26 @@ _ACCESS_LOCK      = threading.Lock()
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024   # 200 МБ на запрос
 
+# ---------------------------------------------------------------------------
+#  CORS для /api/*: фронтенд сайта живёт на ДРУГОМ домене (статика, не Render)
+#  и зовёт этот бэкенд через fetch() — без этих заголовков браузер блокирует
+#  кросс-доменные запросы. Токен передаётся в теле/форме (не в cookie), поэтому
+#  Allow-Origin "*" безопасен — credentials тут не участвуют.
+# ---------------------------------------------------------------------------
+@app.before_request
+def _cors_preflight():
+    if request.method == "OPTIONS" and request.path.startswith("/api/"):
+        return app.make_default_options_response()
+
+
+@app.after_request
+def _cors_headers(resp):
+    if request.path.startswith("/api/"):
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Token"
+    return resp
+
 # ===========================================================================
 #  ПРОМПТ ДЛЯ ИИ (перенос 1:1 из SedStock.py)
 # ===========================================================================
